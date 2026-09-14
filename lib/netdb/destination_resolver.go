@@ -491,3 +491,24 @@ func (dr *DestinationResolver) resolveMetaEntryWithDepth(entryHash [32]byte, ent
 		return dr.extractKeyFromLeaseSet2(hash)
 	}
 }
+
+// ResolveDestinationLease selects a non-expired inbound Lease2 for delivery.
+func (dr *DestinationResolver) ResolveDestinationLease(hash common.Hash) (common.Hash, uint32, error) {
+	raw, err := dr.netdb.GetLeaseSet2Bytes(hash)
+	if err != nil {
+		raw, err = dr.netdb.GetLeaseSetBytes(hash)
+	}
+	if err != nil {
+		return common.Hash{}, 0, err
+	}
+	ls, err := dr.parseLeaseSet2(raw)
+	if err != nil {
+		return common.Hash{}, 0, err
+	}
+	for _, lease := range ls.Leases() {
+		if lease.Time().After(time.Now()) && lease.TunnelID() != 0 {
+			return lease.TunnelGateway(), lease.TunnelID(), nil
+		}
+	}
+	return common.Hash{}, 0, oops.Errorf("destination has no unexpired inbound leases")
+}
