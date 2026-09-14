@@ -591,19 +591,19 @@ func (s *Server) publishLeaseSet2WithLogging(session *Session, leaseSetBytes []b
 // SetDate payload format:
 //
 //	Bytes 0-7:  Current time (milliseconds since epoch, big endian)
-//	Bytes 8-9:  Version string length (big endian uint16)
-//	Bytes 10+:  Protocol version string (UTF-8)
+//	Byte 8:    Version string length (unsigned byte)
+//	Bytes 9+:  Protocol version string (UTF-8)
 
 // parseClientVersion extracts the client protocol version from GetDate payload.
 func parseClientVersion(payload []byte) string {
-	if len(payload) < 2 {
+	if len(payload) == 0 {
 		return ""
 	}
-	strLen := binary.BigEndian.Uint16(payload[0:2])
-	if len(payload) < 2+int(strLen) {
+	strLen := int(payload[0])
+	if len(payload) < 1+strLen {
 		return ""
 	}
-	return string(payload[2 : 2+strLen])
+	return string(payload[1 : 1+strLen])
 }
 
 // storeClientVersionInSession stores the client version in the session if available.
@@ -624,10 +624,10 @@ func (s *Server) storeClientVersionInSession(sessionID uint16, clientVersion str
 // buildSetDatePayload creates the payload for SetDate response.
 func buildSetDatePayload(currentTimeMillis int64, versionStr string) []byte {
 	versionBytes := []byte(versionStr)
-	payload := make([]byte, 8+2+len(versionBytes))
+	payload := make([]byte, 8+1+len(versionBytes))
 	binary.BigEndian.PutUint64(payload[0:8], uint64(currentTimeMillis))
-	binary.BigEndian.PutUint16(payload[8:10], uint16(len(versionBytes)))
-	copy(payload[10:], versionBytes)
+	payload[8] = byte(len(versionBytes))
+	copy(payload[9:], versionBytes)
 	return payload
 }
 
@@ -1566,7 +1566,21 @@ func (s *Server) dispatchToMessageRouter(caller string, session *Session, messag
 		return
 	}
 
-	err := s.messageRouter.RouteOutboundMessage(RouteRequest{
+	resolver, ok := s.destinationResolver.(interface {
+		ResolveDestinationLease(common.Hash) (common.Hash, uint32, error)
+	})
+	if !ok {
+		statusCallback(messageID, MessageStatusNoLeaseSet, uint32(len(payload)), 0)
+		return
+	}
+	gateway, inboundID, err := resolver.ResolveDestinationLease(destination)
+	if err != nil {
+		logDestinationResolutionFailure(caller, session.ID(), messageID, destination, err)
+		statusCallback(messageID, MessageStatusNoLeaseSet, uint32(len(payload)), 0)
+		return
+	}
+	err = s.messageRouter.RouteOutboundMessage(RouteRequest{
+		InboundGateway: gateway, InboundTunnelID: inboundID,
 		Session:           session,
 		MessageID:         messageID,
 		DestinationHash:   destination,

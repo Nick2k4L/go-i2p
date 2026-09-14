@@ -544,3 +544,7 @@ func marshalAndVerifyWireHeader(t *testing.T, msg *Message, expectedTotalLen int
 	}
 	return data
 }
+
+func (m *mockDestinationResolver) ResolveDestinationLease(common.Hash) (common.Hash, uint32, error) {
+	return common.Hash{9}, 456, m.err
+}

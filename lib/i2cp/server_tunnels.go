@@ -121,7 +121,8 @@ func (s *Server) createOutboundPoolWithConfig(session *Session, config *SessionC
 			false,
 		),
 	)
-	pool.SetReplyTunnelProvider(makeReplyTunnelProvider(inboundPool))
+	// Build replies use router encryption and must return through exploratory
+	// endpoints. The shared builder selects that reply tunnel when none is set.
 	session.SetOutboundPool(pool)
 
 	if err := pool.StartMaintenance(); err != nil {
@@ -194,7 +195,7 @@ func makeReplyTunnelProvider(pool *tunnel.Pool) func() (tunnel.TunnelID, common.
 			return 0, common.Hash{}, false
 		}
 		if len(active[0].Hops) > 0 {
-			return active[0].ID, active[0].Hops[0], true
+			return active[0].GatewayID(), active[0].Hops[0], true
 		}
 		return active[0].ID, common.Hash{}, true
 	}
@@ -476,7 +477,7 @@ func encodeLeaseEntry(payload []byte, offset int, tun *tunnel.TunnelState, now t
 	copy(payload[offset:offset+32], tun.Hops[0][:])
 	offset += 32
 
-	binary.BigEndian.PutUint32(payload[offset:offset+4], uint32(tun.ID))
+	binary.BigEndian.PutUint32(payload[offset:offset+4], uint32(tun.GatewayID()))
 	offset += 4
 
 	endDate := calculateLeaseEndDate(tun.CreatedAt, now)

@@ -71,6 +71,7 @@ func addTestTunnelsToPool(pool *tunnel.Pool, baseID int, gatewayPrefix string, c
 			State:     tunnel.TunnelReady,
 			CreatedAt: time.Now(),
 		}
+		state.SetLayerKeys([]tunnel.LayerKeys{{Layer: [32]byte{1}, IV: [32]byte{2}}})
 		pool.AddTunnel(state)
 	}
 }

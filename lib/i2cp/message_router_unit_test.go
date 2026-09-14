@@ -45,6 +45,7 @@ func TestRouteOutboundMessageSuccess(t *testing.T) {
 	// Route message
 	err := router.RouteOutboundMessage(RouteRequest{
 		Session: session, MessageID: 0, DestinationHash: destHash, DestinationPubKey: destPubKey,
+		InboundGateway: [32]byte{9}, InboundTunnelID: 456,
 		Payload: payload, ExpirationMs: 0, StatusCallback: nil,
 	})
 	assert.NoError(t, err)
@@ -52,9 +53,9 @@ func TestRouteOutboundMessageSuccess(t *testing.T) {
 	// Verify message was sent to gateway
 	assert.Len(t, sentMessages, 1, "should send one message to gateway")
 
-	// Verify sent message is a Garlic message
+	// Verify the gateway receives a tunnel frame.
 	for _, msg := range sentMessages {
-		assert.Equal(t, i2np.I2NPMessageTypeGarlic, msg.Type())
+		assert.Equal(t, i2np.I2NPMessageTypeTunnelData, msg.Type())
 	}
 }
 
@@ -96,6 +97,7 @@ func TestRouteOutboundMessageErrors(t *testing.T) {
 
 			err := router.RouteOutboundMessage(RouteRequest{
 				Session: session, MessageID: 0, DestinationHash: destHash, DestinationPubKey: destPubKey,
+				InboundGateway: [32]byte{9}, InboundTunnelID: 456,
 				Payload: payload, ExpirationMs: 0, StatusCallback: nil,
 			})
 			assert.Error(t, err)

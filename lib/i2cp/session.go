@@ -416,6 +416,13 @@ func newSessionInternal(id uint16, dest *destination.Destination, config *Sessio
 		return nil, err
 	}
 
+	return newSessionState(id, dest, config, keyStore), nil
+}
+
+// newSessionState initializes session state. A nil keystore denotes a client-owned
+// destination whose encryption keys arrive with CreateLeaseSet2.
+func newSessionState(id uint16, dest *destination.Destination, config *SessionConfig, keyStore *keys.DestinationKeyStore) *Session {
+	config = ensureValidConfig(config)
 	queueSize := determineQueueSize(config)
 
 	return &Session{
@@ -431,7 +438,7 @@ func newSessionInternal(id uint16, dest *destination.Destination, config *Sessio
 		messageRateLimiter: createRateLimiterIfNeeded(config, id),
 		queueHighWaterMark: queueSize,
 		stopCh:             make(chan struct{}),
-	}, nil
+	}
 }
 
 // extractPrivateKeys extracts signing/encryption keys and optional identity padding from variadic args.
@@ -1087,7 +1094,7 @@ func (s *Session) createLeaseFromTunnel(tun *tunnel.TunnelState) (*lease.Lease2,
 	var gateway data.Hash
 	copy(gateway[:], gatewayBytes[:])
 
-	tunnelID := uint32(tun.ID)
+	tunnelID := uint32(tun.GatewayID())
 	expiration := tun.CreatedAt.Add(s.config.TunnelLifetime)
 
 	// Validate lease expiration: must have meaningful time remaining

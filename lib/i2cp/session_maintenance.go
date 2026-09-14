@@ -34,6 +34,11 @@ func (s *Session) StartLeaseSetMaintenance() error {
 		return oops.Errorf("session %d has no inbound tunnel pool", s.id)
 	}
 
+	// Client-owned identities must sign their own LeaseSets.
+	if s.keys == nil {
+		return nil
+	}
+
 	// Calculate maintenance interval: check every 1/4 of tunnel lifetime
 	// For default 10-minute tunnels, this means checking every 2.5 minutes.
 	// Enforce a minimum of 1ms to prevent ticker panic on zero duration.

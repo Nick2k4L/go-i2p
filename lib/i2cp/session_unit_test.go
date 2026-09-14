@@ -1069,18 +1069,27 @@ func TestSessionManager_CreateAndDestroyMultiple(t *testing.T) {
 	assert.Equal(t, 0, sm.SessionCount())
 }
 
-// TestSessionManager_CreateWithExternalDest verifies that CreateSession with
-// an external destination produces a fully usable session (non-nil keys).
+// TestSessionManager_CreateWithExternalDest verifies that a public I2CP identity
+// is preserved until the client supplies its LeaseSet and encryption key.
 func TestSessionManager_CreateWithExternalDest(t *testing.T) {
 	sm := NewSessionManager()
-
-	ks, err := keys.NewDestinationKeyStore()
+	source, leaseSet := createTestSessionWithLeaseSet(t)
+	defer source.Stop()
+	externalDest := source.Destination()
+	session, err := sm.CreateSession(externalDest, nil)
 	require.NoError(t, err)
-	externalDest := ks.Destination()
-
-	_, err = sm.CreateSession(externalDest, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "client destination requires private keys")
+	defer session.Stop()
+	require.Same(t, externalDest, session.Destination())
+	require.Nil(t, session.keys)
+	require.NoError(t, session.ValidateLeaseSet2Data(leaseSet))
+	_, ok := session.ECIESDecryptionKey()
+	require.False(t, ok)
+	key, ok := source.ECIESDecryptionKey()
+	require.True(t, ok)
+	require.NoError(t, session.StorePrivateKeys(map[uint16][]byte{4: key[:]}))
+	actual, ok := session.ECIESDecryptionKey()
+	require.True(t, ok)
+	require.Equal(t, key, actual)
 }
 
 // TestSessionConfigEncryptedLeaseSet verifies EncryptedLeaseSet configuration fields

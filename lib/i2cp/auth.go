@@ -292,7 +292,7 @@ func (s *Server) requiresAuthentication(msgType byte) bool {
 //
 // Per the I2CP specification, GetDate (type 32) payload format is:
 //
-//	[version_string_length:2][version_string:N][options_mapping...]
+//	[version_string_length:1][version_string:N][options_mapping...]
 //
 // The options mapping may contain "i2cp.username" and "i2cp.password" keys.
 // If credentials are present and valid, the connection is marked as authenticated.
@@ -326,13 +326,13 @@ func extractGetDateCredentials(payload []byte) (username, password string) {
 
 // parseGetDatePayload parses past the version string to find the options mapping.
 func parseGetDatePayload(payload []byte) []byte {
-	if len(payload) < 2 {
+	if len(payload) == 0 {
 		return nil
 	}
 
-	// Skip version string: 2-byte length + string bytes
-	versionLen := int(binary.BigEndian.Uint16(payload[0:2]))
-	offset := 2 + versionLen
+	// Skip the one-byte I2CP String length and version bytes.
+	versionLen := int(payload[0])
+	offset := 1 + versionLen
 	if offset >= len(payload) {
 		return nil // No options mapping after version string
 	}

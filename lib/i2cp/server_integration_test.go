@@ -509,6 +509,7 @@ func TestE2E_OutboundMessageRouting(t *testing.T) {
 			State:     tunnel.TunnelReady,
 			CreatedAt: time.Now(),
 		}
+		tunnelState.SetLayerKeys([]tunnel.LayerKeys{{Layer: [32]byte{1}, IV: [32]byte{2}}})
 		outboundPool.AddTunnel(tunnelState)
 	}
 
@@ -554,6 +555,7 @@ func TestE2E_OutboundMessageRouting(t *testing.T) {
 	// Route the message (messageID=0, no status callback for test)
 	err = router.RouteOutboundMessage(RouteRequest{
 		Session: session, MessageID: 0, DestinationHash: destHash, DestinationPubKey: destPubKey,
+		InboundGateway: [32]byte{9}, InboundTunnelID: 456,
 		Payload: payload, ExpirationMs: 0, StatusCallback: nil,
 	})
 	require.NoError(t, err)
@@ -563,9 +565,9 @@ func TestE2E_OutboundMessageRouting(t *testing.T) {
 	defer sentMutex.Unlock()
 	assert.Len(t, sentMessages, 1, "should send one message to gateway")
 
-	// Verify sent message is a Garlic message
+	// Verify the gateway receives a tunnel frame.
 	for _, msg := range sentMessages {
-		assert.Equal(t, i2np.I2NPMessageTypeGarlic, msg.Type())
+		assert.Equal(t, i2np.I2NPMessageTypeTunnelData, msg.Type())
 	}
 }
 
@@ -629,7 +631,7 @@ func TestE2E_SendMessageIngressToTunnelEgress(t *testing.T) {
 	}
 
 	assert.Equal(t, gatewayHash, sentGateway)
-	assert.Equal(t, i2np.I2NPMessageTypeGarlic, sentMsg.Type())
+	assert.Equal(t, i2np.I2NPMessageTypeTunnelData, sentMsg.Type())
 	assert.Len(t, outboundPool.GetActiveTunnels(), 1)
 }
 

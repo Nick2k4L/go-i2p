@@ -75,6 +75,8 @@ func NewMessageRouter(garlicMgr GarlicMessageEncryptor, transportSend TransportS
 
 // RouteRequest bundles the parameters for routing an outbound I2CP message.
 type RouteRequest struct {
+	InboundGateway    common.Hash // Gateway from the destination's unexpired LeaseSet.
+	InboundTunnelID   uint32
 	Session           *Session              // I2CP session sending the message
 	MessageID         uint32                // Unique identifier for tracking this message
 	DestinationHash   common.Hash           // Hash of the target I2P destination
@@ -113,7 +115,7 @@ func (mr *MessageRouter) RouteOutboundMessage(req RouteRequest) error {
 		return err
 	}
 
-	if err := mr.sendThroughGateway(req.Session, selectedTunnel, req.DestinationHash, garlicMsg); err != nil {
+	if err := mr.sendThroughGateway(req.Session, selectedTunnel, req.DestinationHash, garlicMsg, tunnel.TunnelDelivery(req.InboundTunnelID, req.InboundGateway)); err != nil {
 		notifyStatusCallback(req.StatusCallback, req.MessageID, MessageStatusFailure, req.Payload)
 		return err
 	}
@@ -356,26 +358,44 @@ func (mr *MessageRouter) sendThroughGateway(
 	selectedTunnel *tunnel.TunnelState,
 	destinationHash common.Hash,
 	garlicMsg i2np.Message,
+	delivery tunnel.DeliveryConfig,
 ) error {
 	if mr.transportSend == nil {
 		return oops.Errorf("transport send function not initialized for session %d", session.ID())
 	}
 
-	// Always send to the first hop (gateway) of the tunnel.
-	// Zero-hop tunnels are rejected in validateAndSelectTunnel.
-	gatewayHash := selectedTunnel.Hops[0]
-
-	if err := mr.transportSend(gatewayHash, garlicMsg); err != nil {
-		log.WithFields(logger.Fields{
-			"at":          "i2cp.MessageRouter.sendThroughGateway",
-			"sessionID":   session.ID(),
-			"tunnelID":    selectedTunnel.ID,
-			"gateway":     logutil.HashPrefixPlain(gatewayHash),
-			"destination": logutil.HashPrefixPlain(destinationHash),
-			"error":       err,
-		}).Error("failed_to_send_to_gateway")
-		return oops.Errorf("failed to send message to gateway: %w", err)
+	if delivery.TunnelID == 0 || delivery.Hash == ([32]byte{}) {
+		return oops.Errorf("destination has no usable inbound lease")
 	}
+	keys := selectedTunnel.LayerKeys()
+	if len(keys) != len(selectedTunnel.Hops) {
+		return oops.Errorf("outbound tunnel %d missing negotiated layer keys", selectedTunnel.ID)
+	}
+	crypto, err := tunnel.NewLayeredCrypto(keys)
+	if err != nil {
+		return err
+	}
+	gateway, err := tunnel.NewGateway(selectedTunnel.ID, &tunnel.OutboundCrypto{LayeredCrypto: crypto}, selectedTunnel.GatewayID())
+	if err != nil {
+		return err
+	}
+	serialized, err := garlicMsg.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	frames, err := gateway.SendWithDelivery(serialized, delivery)
+	if err != nil {
+		return err
+	}
+	for _, frame := range frames {
+		var data [1024]byte
+		copy(data[:], frame[4:])
+		msg := i2np.NewTunnelDataMessage(selectedTunnel.GatewayID(), data)
+		if err := mr.transportSend(selectedTunnel.Hops[0], msg); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
