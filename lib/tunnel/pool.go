@@ -19,6 +19,8 @@ import (
 
 // TunnelState represents the current state of a tunnel during building
 type TunnelState struct {
+	layerKeys       []LayerKeys
+	OnRemove        func() // Releases endpoint resources when the owning pool removes this tunnel.
 	mu              sync.RWMutex
 	ID              TunnelID
 	GatewayTunnelID TunnelID         // Inbound gateway receive tunnel ID (for reply routing)
@@ -434,11 +436,15 @@ func (p *Pool) GetTunnel(id TunnelID) (*TunnelState, bool) {
 func (p *Pool) AddTunnel(tunnel *TunnelState) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
+	if p.IsStopped() {
+		if tunnel.OnRemove != nil {
+			tunnel.OnRemove()
+		}
+		return
+	}
 	p.tunnels[tunnel.ID] = tunnel
 	p.cachedDirty.Store(true)
-	tunnel.mu.RLock()
 	ts := tunnel.GetState()
-	tunnel.mu.RUnlock()
 	log.WithFields(logger.Fields{
 		"at":           "(Pool) AddTunnel",
 		"phase":        "tunnel_build",
@@ -468,9 +474,7 @@ func (p *Pool) ReanchorBuildStart(id TunnelID) {
 	if !exists {
 		return
 	}
-	tunnel.mu.RLock()
 	state := tunnel.GetState()
-	tunnel.mu.RUnlock()
 	if state != TunnelBuilding {
 		return
 	}
@@ -491,12 +495,13 @@ func (p *Pool) RemoveTunnel(id TunnelID) {
 	defer p.mutex.Unlock()
 	tunnel, existed := p.tunnels[id]
 	delete(p.tunnels, id)
+	if existed && tunnel.OnRemove != nil {
+		tunnel.OnRemove()
+	}
 	p.cachedDirty.Store(true)
 	var tsStr string
 	if existed {
-		tunnel.mu.RLock()
 		ts := tunnel.GetState()
-		tunnel.mu.RUnlock()
 		tsStr = fmt.Sprintf("%v", ts)
 	} else {
 		tsStr = "unknown"
@@ -519,9 +524,7 @@ func (p *Pool) GetActiveTunnels() []*TunnelState {
 
 	var active []*TunnelState
 	for _, tunnel := range p.tunnels {
-		tunnel.mu.RLock()
 		state := tunnel.GetState()
-		tunnel.mu.RUnlock()
 		if state == TunnelReady {
 			active = append(active, tunnel)
 		}
@@ -542,6 +545,15 @@ func (p *Pool) Stop() {
 		p.cancel()
 	}
 	p.maintWg.Wait() // Wait for maintenance goroutine to exit
+	p.mutex.Lock()
+	for id, state := range p.tunnels {
+		if state.OnRemove != nil {
+			state.OnRemove()
+		}
+		delete(p.tunnels, id)
+	}
+	p.cachedDirty.Store(true)
+	p.mutex.Unlock()
 	log.WithFields(logger.Fields{
 		"at":        "(Pool) Stop",
 		"phase":     "tunnel_build",
@@ -559,17 +571,13 @@ func (p *Pool) CleanupExpiredTunnels(maxAge time.Duration) {
 	var expired []TunnelID
 
 	for id, tunnel := range p.tunnels {
-		tunnel.mu.RLock()
 		state := tunnel.GetState()
-		tunnel.mu.RUnlock()
 		if state == TunnelBuilding && now.Sub(tunnel.CreatedAt) > maxAge {
 			expired = append(expired, id)
 		}
 	}
 
-	for _, id := range expired {
-		delete(p.tunnels, id)
-	}
+	p.removeTunnels(expired)
 
 	if len(expired) > 0 {
 		log.WithFields(logger.Fields{
@@ -756,6 +764,7 @@ func (p *Pool) prepareBuildRequest(excludePeers []common.Hash) BuildTunnelReques
 	}
 
 	return BuildTunnelRequest{
+		OwnerPool:                 p,
 		HopCount:                  p.config.HopCount,
 		IsInbound:                 p.config.IsInbound,
 		IsClientTunnel:            p.config.IsClientPool,
@@ -898,9 +907,7 @@ func (p *Pool) rebuildActiveCacheLocked() []*TunnelState {
 
 	var active []*TunnelState
 	for _, tunnel := range p.tunnels {
-		tunnel.mu.RLock()
 		state := tunnel.GetState()
-		tunnel.mu.RUnlock()
 		if state == TunnelReady {
 			active = append(active, tunnel)
 		}
@@ -931,9 +938,7 @@ func (p *Pool) GetPoolStats() PoolStats {
 	now := time.Now()
 
 	for _, tunnel := range p.tunnels {
-		tunnel.mu.RLock()
 		state := tunnel.GetState()
-		tunnel.mu.RUnlock()
 		switch state {
 		case TunnelBuilding:
 			stats.Building++
@@ -984,33 +989,11 @@ func (p *Pool) RetryTunnelBuild(tunnelID TunnelID, isInbound bool, hopCount int)
 		return oops.Errorf("tunnel builder not set; cannot retry tunnel build for tunnel %d", tunnelID)
 	}
 
-	p.mutex.RLock()
-	routerHash := p.routerHash
-	provider := p.replyTunnelProvider
-	p.mutex.RUnlock()
-
-	replyTunnelID := TunnelID(0)
-	replyGateway := routerHash
-	if provider != nil {
-		if id, gw, ok := provider(); ok {
-			replyTunnelID = id
-			if gw != (common.Hash{}) {
-				replyGateway = gw
-			}
-		}
+	if err := p.checkRetryContext(); err != nil {
+		return err
 	}
-
-	req := BuildTunnelRequest{
-		IsInbound:                 isInbound,
-		IsClientTunnel:            p.config.IsClientPool,
-		HopCount:                  hopCount,
-		UseShortBuild:             true, // Modern STBM (type 25); legacy VTB (type 21) is rejected by current peers
-		ExcludePeers:              p.GetFailedPeers(),
-		RequireDirectConnectivity: true,
-		OurIdentity:               routerHash,
-		ReplyGateway:              replyGateway,
-		ReplyTunnelID:             replyTunnelID, // Non-zero = TUNNEL delivery via existing session (NAT-safe)
-	}
+	req := p.prepareBuildRequest(p.GetFailedPeers())
+	req.HopCount = hopCount
 
 	result, err := builder.BuildTunnel(req)
 	if err != nil {
@@ -1478,4 +1461,29 @@ func (p *Pool) GetFailedPeers() []common.Hash {
 	}
 
 	return failed
+}
+
+// IsStopped reports whether maintenance and new builds have been cancelled.
+func (p *Pool) IsStopped() bool { return p.ctx.Err() != nil }
+
+// GatewayID returns the ID advertised at the remote inbound gateway.
+func (t *TunnelState) GatewayID() TunnelID {
+	if t.GatewayTunnelID != 0 {
+		return t.GatewayTunnelID
+	}
+	return t.ID
+}
+
+// SetLayerKeys installs negotiated tunnel data keys before publishing readiness.
+func (t *TunnelState) SetLayerKeys(keys []LayerKeys) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.layerKeys = append([]LayerKeys(nil), keys...)
+}
+
+// LayerKeys returns a copy of the negotiated remote-hop keys.
+func (t *TunnelState) LayerKeys() []LayerKeys {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]LayerKeys(nil), t.layerKeys...)
 }

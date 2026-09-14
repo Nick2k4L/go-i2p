@@ -288,7 +288,7 @@ func (r *Router) wireReplyTunnelProviders(inboundPool, outboundPool *tunnel.Pool
 			}
 			// Prefer the oldest active tunnel for stability.
 			if len(active[0].Hops) > 0 {
-				return active[0].ID, active[0].Hops[0], true
+				return active[0].GatewayID(), active[0].Hops[0], true
 			}
 			return active[0].ID, common.Hash{}, true
 		}

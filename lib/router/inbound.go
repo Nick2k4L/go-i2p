@@ -144,12 +144,9 @@ func (h *InboundMessageHandler) CreateEndpointForSession(tunnelID tunnel.TunnelI
 		return nil, oops.Errorf("cannot create endpoint for session %d: I2CP session manager not configured", sessionID)
 	}
 
-	// Build the per-session garlic decryptor from the destination's ECIES key so
-	// inbound end-to-end-encrypted garlic can be decrypted before delivery.
-	decryptor := h.buildSessionGarlicDecryptor(sessionID)
-
-	// Create the message handler that decrypts and delivers messages to the I2CP session
-	messageHandler := h.createMessageHandler(sessionID, decryptor)
+	// Client encryption keys arrive with CreateLeaseSet2, after tunnel creation.
+	// Resolve the decryptor on first delivery so it uses the published key.
+	messageHandler := h.createMessageHandler(sessionID, nil)
 
 	// Create the endpoint with the handler wired in
 	endpoint, err := tunnel.NewEndpoint(tunnelID, decryption, messageHandler)
@@ -343,6 +340,7 @@ func (h *InboundMessageHandler) decryptAndDeliver(tunnelID tunnel.TunnelID, data
 //
 // Returns a MessageHandler callback function.
 func (h *InboundMessageHandler) createMessageHandler(sessionID uint16, decryptor *i2np.GarlicSessionManager) tunnel.MessageHandler {
+	var decryptorMu sync.Mutex
 	return func(msgBytes []byte) error {
 		if h.sessionManager == nil {
 			return oops.Errorf("cannot deliver message for session %d: I2CP session manager not configured", sessionID)
@@ -358,7 +356,12 @@ func (h *InboundMessageHandler) createMessageHandler(sessionID uint16, decryptor
 			return oops.Errorf("session %d not found", sessionID)
 		}
 
+		decryptorMu.Lock()
+		if decryptor == nil {
+			decryptor = h.buildSessionGarlicDecryptor(sessionID)
+		}
 		payloads, err := h.extractClientPayloads(sessionID, msgBytes, decryptor)
+		decryptorMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -526,9 +529,8 @@ func (h *InboundMessageHandler) createControlPlaneHandler(tunnelID tunnel.Tunnel
 // delivery mode by a remote OBEP) are decrypted and dispatched through the
 // MessageProcessor rather than silently dropped.
 //
-// A passthrough (identity) TunnelEncryptor is used because the remote OBEP
-// sends TunnelData directly to our router (NextIdent = our hash) without
-// layering the encryption of T1's intermediate hops.
+// This compatibility entry point registers a zero-hop endpoint. Remote-hop
+// builds use RegisterInboundTunnel with their negotiated layer keys.
 func (h *InboundMessageHandler) RegisterExploratoryTunnel(tunnelID tunnel.TunnelID) error {
 	endpoint, err := tunnel.NewEndpoint(tunnelID, &passthroughTunnelEncryptor{}, h.createControlPlaneHandler(tunnelID))
 	if err != nil {
@@ -551,8 +553,8 @@ func (h *InboundMessageHandler) RegisterExploratoryTunnel(tunnelID tunnel.Tunnel
 
 // RegisterClientTunnel registers an inbound client tunnel endpoint for message delivery to an I2CP session.
 // The endpoint is created with a message handler that queues decrypted messages to the owning I2CP session.
-// A passthrough (identity) TunnelEncryptor is used because the inbound gateway sends TunnelData
-// directly to our router without layering the encryption of intermediate hops.
+// This compatibility entry point is for zero-hop client tunnels. Remote-hop
+// builds use RegisterInboundTunnel with their negotiated layer keys.
 //
 // Parameters:
 // - tunnelID: the ID of the inbound tunnel
@@ -815,5 +817,34 @@ func (h *InboundMessageHandler) forwardToNextHop(participant *tunnel.Participant
 		"next_hop_id": nextHopID,
 	}).Debug("Successfully queued transit tunnel data for forwarding")
 
+	return nil
+}
+
+// RegisterInboundTunnel installs the negotiated tunnel-layer decryptor for an
+// inbound tunnel. Empty keys are reserved for zero-hop tunnels.
+func (h *InboundMessageHandler) RegisterInboundTunnel(id tunnel.TunnelID, sessionID uint16, client bool, keys []tunnel.LayerKeys) error {
+	decryptor, err := tunnel.NewLayeredCrypto(keys)
+	if err != nil {
+		return err
+	}
+	if client {
+		if h.sessionManager == nil {
+			return oops.Errorf("I2CP session manager not configured")
+		}
+		if _, ok := h.sessionManager.GetSession(sessionID); !ok {
+			return oops.Errorf("session %d not found", sessionID)
+		}
+		_, err = h.CreateEndpointForSession(id, sessionID, decryptor)
+		return err
+	}
+	endpoint, err := tunnel.NewEndpoint(id, decryptor, h.createControlPlaneHandler(id))
+	if err != nil {
+		return err
+	}
+	endpoint.SetForwarder(h)
+	if err := h.RegisterTunnel(id, 0, endpoint); err != nil {
+		endpoint.Stop()
+		return err
+	}
 	return nil
 }

@@ -1008,7 +1008,8 @@ func TestTunnelCreation_RoutingParamsInbound(t *testing.T) {
 
 	// Last hop (gateway) should point to our reply tunnel
 	lastRecord := result.Records[2]
-	assert.Equal(t, replyTunnelID, lastRecord.NextTunnel, "inbound gateway must point to reply tunnel")
+	assert.Equal(t, result.TunnelID, lastRecord.NextTunnel, "last inbound hop must point to local receiving tunnel")
+	assert.NotEqual(t, result.GatewayTunnelID, result.TunnelID)
 	assert.Equal(t, replyGateway, lastRecord.NextIdent, "inbound gateway must target reply gateway")
 }
 

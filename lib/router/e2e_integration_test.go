@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"time"
@@ -343,12 +344,28 @@ func setupCompleteE2EEnvironment(t *testing.T) *e2eTestEnvironment {
 	env.garlicManager, err = i2np.NewGarlicSessionManager(privKey)
 	require.NoError(t, err)
 
-	// Create message router with transport send function that captures messages
+	// Simulate the remote outbound hop and reassemble its tunnel delivery.
+	identity, err := tunnel.NewLayeredCrypto(nil)
+	require.NoError(t, err)
+	endpoint, err := tunnel.NewEndpoint(3000, identity, func([]byte) error { return oops.Errorf("unexpected local delivery") })
+	require.NoError(t, err)
+	endpoint.SetForwarder(&e2eOutboundForwarder{env: env})
+	env.cleanupFuncs = append(env.cleanupFuncs, endpoint.Stop)
+	remote, err := tunnel.NewLayeredCrypto([]tunnel.LayerKeys{{Layer: [32]byte{1}, IV: [32]byte{2}}})
+	require.NoError(t, err)
 	transportSend := func(peerHash common.Hash, msg i2np.Message) error {
-		env.sentMutex.Lock()
-		defer env.sentMutex.Unlock()
-		env.sentMessages = append(env.sentMessages, msg)
-		return nil
+		data, ok := msg.(*i2np.TunnelDataMessage)
+		if !ok {
+			return oops.Errorf("expected TunnelData, got %T", msg)
+		}
+		frame := make([]byte, 1028)
+		binary.BigEndian.PutUint32(frame, 3000)
+		copy(frame[4:], data.GetTunnelData())
+		plain, err := remote.Encrypt(frame)
+		if err != nil {
+			return err
+		}
+		return endpoint.Receive(plain)
 	}
 
 	env.messageRouter = i2cp.NewMessageRouter(env.garlicManager, transportSend)
@@ -419,6 +436,7 @@ func (env *e2eTestEnvironment) addTunnelsToPool(t *testing.T, pool *tunnel.Pool,
 			State:     tunnel.TunnelReady,
 			CreatedAt: time.Now(),
 		}
+		tunnelState.SetLayerKeys([]tunnel.LayerKeys{{Layer: [32]byte{1}, IV: [32]byte{2}}})
 		pool.AddTunnel(tunnelState)
 	}
 }
@@ -432,6 +450,7 @@ func (env *e2eTestEnvironment) SendMessageFromClient(
 ) error {
 	return env.messageRouter.RouteOutboundMessage(i2cp.RouteRequest{
 		Session: session, DestinationHash: destHash, DestinationPubKey: destPubKey, Payload: payload,
+		InboundGateway: common.Hash{9}, InboundTunnelID: 456,
 	})
 }
 
@@ -666,4 +685,24 @@ func (m *mockTunnelBuilder) BuildTunnel(req tunnel.BuildTunnelRequest) (*tunnel.
 		TunnelID:   m.nextID,
 		PeerHashes: nil,
 	}, nil
+}
+
+// e2eOutboundForwarder captures complete messages after tunnel reassembly.
+type e2eOutboundForwarder struct{ env *e2eTestEnvironment }
+
+func (f *e2eOutboundForwarder) ForwardToTunnel(id uint32, gateway [32]byte, payload []byte) error {
+	if id != 456 || gateway != ([32]byte{9}) {
+		return oops.Errorf("unexpected lease")
+	}
+	msg := &i2np.BaseI2NPMessage{}
+	if err := msg.UnmarshalBinary(payload); err != nil {
+		return err
+	}
+	f.env.sentMutex.Lock()
+	defer f.env.sentMutex.Unlock()
+	f.env.sentMessages = append(f.env.sentMessages, msg)
+	return nil
+}
+func (f *e2eOutboundForwarder) ForwardToRouter([32]byte, []byte) error {
+	return oops.Errorf("unexpected router delivery")
 }

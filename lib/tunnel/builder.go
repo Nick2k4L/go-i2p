@@ -53,6 +53,7 @@ func NewTunnelBuilder(selector PeerSelector) (*TunnelBuilder, error) {
 // This prevents session establishment failures by only selecting peers with direct NTCP2 addresses.
 // Set to true in production; tests may leave false to test with mock peers.
 type BuildTunnelRequest struct {
+	OwnerPool                 *Pool         // Pool that owns this build and its lifecycle; nil uses router pools.
 	HopCount                  int           // Number of hops in the tunnel (1-8)
 	IsInbound                 bool          // True for inbound tunnel, false for outbound
 	IsClientTunnel            bool          // True for I2CP session-scoped client pools (vs exploratory router pools)
@@ -67,6 +68,7 @@ type BuildTunnelRequest struct {
 
 // TunnelBuildResult contains the result of building a tunnel request.
 type TunnelBuildResult struct {
+	LayerKeys       []LayerKeys              // Negotiated tunnel data keys in remote-hop order.
 	TunnelID        TunnelID                 // The generated tunnel ID
 	GatewayTunnelID TunnelID                 // Inbound gateway receive tunnel ID
 	Hops            []router_info.RouterInfo // Selected router hops
@@ -206,9 +208,17 @@ func (tb *TunnelBuilder) CreateBuildRequest(req BuildTunnelRequest) (*TunnelBuil
 	logBuildRequestComplete(req, hopTunnelIDs[0], len(records))
 
 	gatewayTunnelID := hopTunnelIDs[0]
+	localID := gatewayTunnelID
+	if req.IsInbound {
+		localID, err = generateTunnelID()
+		if err != nil {
+			return nil, err
+		}
+		records[len(records)-1].NextTunnel = localID
+	}
 
 	return &TunnelBuildResult{
-		TunnelID:        hopTunnelIDs[0],
+		TunnelID:        localID,
 		GatewayTunnelID: gatewayTunnelID,
 		Hops:            peers,
 		Records:         records,

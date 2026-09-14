@@ -240,7 +240,7 @@ func TestCreateMessageHandler(t *testing.T) {
 	session, err := sessionManager.CreateSession(nil, i2cp.DefaultSessionConfig())
 	require.NoError(t, err)
 
-	// A missing decryptor should fail closed rather than queue raw bytes.
+	// Lazy decryption must still reject raw non-garlic input.
 	msgHandler := handler.createMessageHandler(session.ID(), nil)
 	assert.NotNil(t, msgHandler)
 
@@ -248,7 +248,7 @@ func TestCreateMessageHandler(t *testing.T) {
 	testMsg := []byte("test message payload")
 	err = msgHandler(testMsg)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "no garlic decryptor")
+	assert.Contains(t, err.Error(), "expected I2NP garlic message")
 
 	// The handler should return before queuing anything for the client.
 	assert.NotNil(t, session)
@@ -797,4 +797,49 @@ func TestHandleTunnelDataTransitFullIntegration(t *testing.T) {
 	}
 
 	t.Log("SUCCESS: Transit tunnel forwarding validated - C1 (size) and C2 (nextHopID) fixes confirmed")
+}
+
+func TestInboundGarlicKeyArrivesAfterTunnelCreation(t *testing.T) {
+	sessionManager := i2cp.NewSessionManager()
+	handler := NewInboundMessageHandler(sessionManager)
+
+	session, err := sessionManager.CreateSession(nil, i2cp.DefaultSessionConfig())
+	require.NoError(t, err)
+
+	msgHandler := handler.createMessageHandler(session.ID(), nil)
+
+	// Install a known ECIES-X25519 key on the session (as CreateLeaseSet2 would),
+	// and derive the matching public key the sender encrypts to.
+	recvPub, recvPriv, err := ecies.GenerateKeyPair()
+	require.NoError(t, err)
+	require.NoError(t, session.StorePrivateKeys(map[uint16][]byte{
+		key_certificate.KEYCERT_CRYPTO_X25519: recvPriv,
+	}))
+
+	var recvPubKey [32]byte
+	copy(recvPubKey[:], recvPub)
+	destHash := types.SHA256(recvPubKey[:])
+
+	// Build + encrypt a garlic exactly like the i2cp sender does.
+	senderSM, err := i2np.GenerateGarlicSessionManager()
+	require.NoError(t, err)
+	builder, err := i2np.NewGarlicBuilderWithDefaults()
+	require.NoError(t, err)
+	appPayload := []byte("end-to-end inbound payload")
+	require.NoError(t, builder.AddLocalDeliveryClove(i2np.NewDataMessage(appPayload), 1))
+	ciphertext, err := i2np.EncryptGarlicWithBuilder(senderSM, builder, destHash, recvPubKey)
+	require.NoError(t, err)
+	garlicMsg, err := i2np.WrapInGarlicMessage(ciphertext)
+	require.NoError(t, err)
+	garlicBytes, err := garlicMsg.MarshalBinary()
+	require.NoError(t, err)
+
+	require.NoError(t, msgHandler(garlicBytes))
+
+	// The client must receive the DECRYPTED application payload, not ciphertext.
+	received, err := session.ReceiveMessage()
+	require.NoError(t, err)
+	require.NotNil(t, received)
+	assert.Equal(t, appPayload, received.Payload,
+		"client must receive the decrypted payload, not raw garlic ciphertext")
 }

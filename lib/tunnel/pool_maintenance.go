@@ -226,6 +226,9 @@ func (p *Pool) isBuildTimeout(tunnel *TunnelState, age time.Duration) bool {
 // removeTunnels deletes the specified tunnel IDs from the pool.
 func (p *Pool) removeTunnels(expired []TunnelID) {
 	for _, id := range expired {
+		if state := p.tunnels[id]; state != nil && state.OnRemove != nil {
+			state.OnRemove()
+		}
 		delete(p.tunnels, id)
 	}
 }
