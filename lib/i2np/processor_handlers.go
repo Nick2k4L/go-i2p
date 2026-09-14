@@ -801,7 +801,11 @@ func (p *MessageProcessor) handleTunnelDelivery(index int, clove GarlicClove) {
 // and delivery to the owning I2CP session. Otherwise the message is validated and logged.
 func (p *MessageProcessor) processTunnelDataMessage(msg Message) error {
 	if _, ok := msg.(TunnelCarrier); !ok {
-		return oops.Errorf("message does not implement TunnelCarrier interface")
+		parsed, err := parseTunnelDataMessage(msg)
+		if err != nil {
+			return err
+		}
+		msg = parsed
 	}
 
 	// Delegate to handler if available

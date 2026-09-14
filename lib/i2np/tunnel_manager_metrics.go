@@ -62,6 +62,9 @@ func chacha20XORRecord(record *[ShortBuildRecordSize]byte, key [32]byte, index i
 	if err != nil {
 		return oops.Wrapf(err, "ChaCha20 init failed")
 	}
+	// I2P uses counter 1 for raw ChaCha20 build-record masking, matching
+	// the payload stream of ChaCha20-Poly1305 (counter 0 is reserved).
+	c.SetCounter(1)
 	c.XORKeyStream(record[:], record[:])
 	return nil
 }

@@ -15,6 +15,14 @@ func (tm *TunnelManager) ProcessTunnelBuildReply(handler TunnelReplyHandler, mes
 	return tm.ProcessTunnelReply(handler, messageID)
 }
 
+// HasPendingInboundBuild identifies a returning inbound build message.
+func (tm *TunnelManager) HasPendingInboundBuild(messageID int) bool {
+	tm.buildMutex.RLock()
+	defer tm.buildMutex.RUnlock()
+	req, ok := tm.pendingBuilds[messageID]
+	return ok && req.isInbound
+}
+
 // ProcessTunnelReply processes tunnel build replies using TunnelReplyHandler interface.
 // This method integrates with the tunnel pool to update tunnel states and handle build completions.
 // Uses message ID to correlate the reply with the original build request.
@@ -306,7 +314,7 @@ func (tm *TunnelManager) accountCorrelatedReplyWithoutTunnelState(req *buildRequ
 		"error":            replyErr,
 		"is_client_tunnel": req.isClientTunnel,
 	}).Warn("Counted failed tunnel build reply without tunnel state in pool")
-	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound)
+	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound, tm.poolForRequest(req.ownerPool, req.isInbound))
 }
 
 // logNoMatchingTunnel logs a warning when no building tunnel matches the reply.
@@ -349,7 +357,7 @@ func (tm *TunnelManager) updateTunnelBasedOnReply(matchingTunnel *tunnel.TunnelS
 		tm.handleSuccessfulBuild(matchingTunnel, messageID)
 	} else {
 		// Apply per-hop attribution for failed builds
-		if pool := tm.getPoolForTunnel(matchingTunnel.IsInbound); pool != nil {
+		if pool := tm.poolForMessage(messageID, matchingTunnel.IsInbound); pool != nil {
 			pool.MarkFailedHopsFromReply(matchingTunnel.Hops, responses)
 		}
 		tm.handleFailedBuild(matchingTunnel, messageID, replyErr)
@@ -360,7 +368,7 @@ func (tm *TunnelManager) updateTunnelBasedOnReply(matchingTunnel *tunnel.TunnelS
 func (tm *TunnelManager) handleSuccessfulBuild(matchingTunnel *tunnel.TunnelState, messageID int) {
 	buildTimeMs := float64(time.Since(matchingTunnel.CreatedAt).Milliseconds())
 	matchingTunnel.SetState(tunnel.TunnelReady)
-	if pool := tm.getPoolForTunnel(matchingTunnel.IsInbound); pool != nil {
+	if pool := tm.poolForMessage(messageID, matchingTunnel.IsInbound); pool != nil {
 		pool.InvalidateActiveCache()
 	}
 
@@ -410,7 +418,7 @@ func (tm *TunnelManager) handleFailedBuild(matchingTunnel *tunnel.TunnelState, m
 		tm.inboundHandler.UnregisterTunnel(matchingTunnel.ID)
 	}
 
-	tm.cleanupFailedTunnel(matchingTunnel.ID, matchingTunnel.IsInbound)
+	tm.cleanupFailedTunnel(matchingTunnel.ID, matchingTunnel.IsInbound, tm.poolForMessage(messageID, matchingTunnel.IsInbound))
 }
 
 // findMatchingBuildingTunnel finds a tunnel that's currently building based on the message ID.
@@ -426,7 +434,7 @@ func (tm *TunnelManager) findMatchingBuildingTunnel(messageID int) *tunnel.Tunne
 	}
 
 	// Look up the tunnel state from the pool
-	pool := tm.getPoolForTunnel(req.isInbound)
+	pool := tm.poolForRequest(req.ownerPool, req.isInbound)
 	tunnelState, exists := pool.GetTunnel(req.tunnelID)
 	if !exists {
 		log.WithField("tunnel_id", req.tunnelID).Warn("Tunnel state not found in pool")
@@ -444,9 +452,12 @@ func (tm *TunnelManager) findMatchingBuildingTunnel(messageID int) *tunnel.Tunne
 
 // cleanupFailedTunnel schedules removal of a failed tunnel from the pool after a delay.
 // Uses time.AfterFunc instead of time.Sleep to avoid blocking a goroutine.
-func (tm *TunnelManager) cleanupFailedTunnel(tunnelID tunnel.TunnelID, isInbound bool) {
+func (tm *TunnelManager) cleanupFailedTunnel(tunnelID tunnel.TunnelID, isInbound bool, owners ...*tunnel.Pool) {
 	time.AfterFunc(1*time.Second, func() {
 		pool := tm.getPoolForTunnel(isInbound)
+		if len(owners) > 0 {
+			pool = owners[0]
+		}
 		if pool != nil {
 			pool.RemoveTunnel(tunnelID)
 			log.WithField("tunnel_id", tunnelID).Debug("Cleaned up failed tunnel")
@@ -544,13 +555,13 @@ func (tm *TunnelManager) isRequestExpired(req *buildRequest, now time.Time, time
 
 // handleExpiredRequest marks tunnel as failed and schedules cleanup.
 func (tm *TunnelManager) handleExpiredRequest(req *buildRequest, msgID int, now time.Time) {
-	pool := tm.getPoolForTunnel(req.isInbound)
+	pool := tm.poolForRequest(req.ownerPool, req.isInbound)
 	tunnelState, exists := pool.GetTunnel(req.tunnelID)
 	if !exists {
 		return
 	}
 
-	tunnelState.State = tunnel.TunnelFailed
+	tunnelState.SetState(tunnel.TunnelFailed)
 	tm.recordBuildExpire(req.isClientTunnel)
 	if req.isInbound {
 		pool.RecordInboundBuildTimeout()
@@ -581,7 +592,7 @@ func (tm *TunnelManager) handleExpiredRequest(req *buildRequest, msgID int, now 
 		tm.inboundHandler.UnregisterTunnel(req.tunnelID)
 	}
 
-	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound)
+	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound, tm.poolForRequest(req.ownerPool, req.isInbound))
 }
 
 // removeExpiredFromMap deletes expired build requests from the pending map.
@@ -646,13 +657,13 @@ func (tm *TunnelManager) processExpiredBuild(messageID int, req *buildRequest) {
 
 // markTunnelAsFailed marks a tunnel as failed and schedules cleanup.
 func (tm *TunnelManager) markTunnelAsFailed(req *buildRequest) {
-	pool := tm.getPoolForTunnel(req.isInbound)
+	pool := tm.poolForRequest(req.ownerPool, req.isInbound)
 	tunnelState, exists := pool.GetTunnel(req.tunnelID)
 	if !exists {
 		return
 	}
 
-	tunnelState.State = tunnel.TunnelFailed
+	tunnelState.SetState(tunnel.TunnelFailed)
 
 	tm.recordBuildTimeoutMetrics(req)
 
@@ -662,7 +673,7 @@ func (tm *TunnelManager) markTunnelAsFailed(req *buildRequest) {
 		pool.RecordOutboundBuildTimeout()
 	}
 
-	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound)
+	tm.cleanupFailedTunnel(req.tunnelID, req.isInbound, tm.poolForRequest(req.ownerPool, req.isInbound))
 }
 
 // recordBuildTimeoutMetrics records timeout events to the appropriate time window.

@@ -23,6 +23,11 @@ import (
 // 4. Accept or reject based on available capacity and rate limits
 // 5. Generate and send appropriate build reply
 func (p *MessageProcessor) processShortTunnelBuildMessage(msg Message) error {
+	// An inbound build returns to its creator as type 25, with the response
+	// records in place. Only locally pending inbound IDs take the reply path.
+	if tracker, ok := p.buildReplyProcessor.(interface{ HasPendingInboundBuild(int) bool }); ok && tracker.HasPendingInboundBuild(msg.MessageID()) {
+		return p.processBuildReplyCommon(msg, true)
+	}
 	return newBuildRequestProcessor(p, msg, true).process()
 }
 

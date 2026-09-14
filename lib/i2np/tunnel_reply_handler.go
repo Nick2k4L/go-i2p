@@ -45,6 +45,7 @@ func DefaultReplyProcessorConfig() ReplyProcessorConfig {
 
 // PendingBuildRequest tracks an in-progress tunnel build request.
 type PendingBuildRequest struct {
+	retry        func() error // Optional retry bound to the requesting pool.
 	TunnelID     buildrecord.TunnelID
 	RequestedAt  time.Time
 	ReplyKeys    []session_key.SessionKey // ECIES-X25519-AEAD keys for decrypting each hop's reply
@@ -515,7 +516,7 @@ func (rp *ReplyProcessor) handleBuildFailure(
 
 // retryBuild attempts to retry a failed tunnel build with exponential backoff.
 func (rp *ReplyProcessor) retryBuild(tunnelID buildrecord.TunnelID, pending *PendingBuildRequest) error {
-	if rp.retryCallback == nil {
+	if rp.retryCallback == nil && pending.retry == nil {
 		log.WithFields(logger.Fields{"at": "retryBuild"}).Warn("No retry callback configured, cannot retry tunnel build")
 		return oops.Errorf("retry not available")
 	}
@@ -545,7 +546,11 @@ func (rp *ReplyProcessor) retryBuild(tunnelID buildrecord.TunnelID, pending *Pen
 			log.WithField("tunnel_id", tunnelID).Debug("Skipping retry callback: processor stopped")
 			return
 		}
-		if err := rp.retryCallback(tunnelID, pending.IsInbound, pending.HopCount); err != nil {
+		retry := pending.retry
+		if retry == nil {
+			retry = func() error { return rp.retryCallback(tunnelID, pending.IsInbound, pending.HopCount) }
+		}
+		if err := retry(); err != nil {
 			log.WithFields(logger.Fields{
 				"tunnel_id": tunnelID,
 				"error":     err,

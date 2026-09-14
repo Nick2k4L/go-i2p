@@ -39,6 +39,25 @@ func NewTunnelCarrier(tunnelID buildrecord.TunnelID, data [1024]byte) TunnelCarr
 	return NewTunnelDataMessage(tunnelID, data)
 }
 
+// parseTunnelDataMessage converts the generic message returned by transport
+// decoders into a TunnelCarrier while preserving the received I2NP metadata.
+func parseTunnelDataMessage(msg Message) (*TunnelDataMessage, error) {
+	carrier, ok := msg.(DataCarrier)
+	if !ok {
+		return nil, oops.Errorf("TunnelData message does not expose its payload")
+	}
+	payload := carrier.GetData()
+	if len(payload) != 1028 {
+		return nil, oops.Errorf("tunnel data message payload wrong size: expected 1028 bytes, got %d", len(payload))
+	}
+	parsed := &TunnelDataMessage{
+		BaseI2NPMessage: BaseMessageFromMessage(msg, payload),
+		TunnelID:        buildrecord.TunnelID(binary.BigEndian.Uint32(payload[:4])),
+	}
+	copy(parsed.Data[:], payload[4:])
+	return parsed, nil
+}
+
 // UnmarshalBinary deserializes a TunnelData message.
 // The payload must be exactly 1028 bytes: 4-byte TunnelID + 1024-byte Data.
 func (t *TunnelDataMessage) UnmarshalBinary(data []byte) error {

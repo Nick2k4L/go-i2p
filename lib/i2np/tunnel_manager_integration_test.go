@@ -171,5 +171,6 @@ func TestNewTunnelManager_WiresExploratoryReplyTunnelProvider(t *testing.T) {
 	err := inboundPool.RetryTunnelBuild(tunnel.TunnelID(7), true, 2)
 	require.NoError(t, err)
 	require.True(t, builder.called)
-	assert.Equal(t, replyTunnelID, builder.lastReq.ReplyTunnelID)
+	assert.Zero(t, builder.lastReq.ReplyTunnelID, "inbound retries terminate locally, not through an existing tunnel")
+	assert.Same(t, inboundPool, builder.lastReq.OwnerPool)
 }

@@ -3,7 +3,6 @@ package i2np
 import (
 	"encoding/binary"
 	"fmt"
-	"strings"
 	"time"
 
 	common "github.com/go-i2p/common/data"
@@ -46,6 +45,9 @@ func (tm *TunnelManager) BuildTunnel(req tunnel.BuildTunnelRequest) (*tunnel.Bui
 // 4. Sends the build request via appropriate transport
 // 5. Returns the tunnel ID, selected peer hashes, and any error
 func (tm *TunnelManager) BuildTunnelFromRequest(req tunnel.BuildTunnelRequest) (tunnel.TunnelID, []common.Hash, error) {
+	if req.OwnerPool != nil && req.OwnerPool.IsStopped() {
+		return 0, nil, oops.Errorf("tunnel pool stopped")
+	}
 	if err := tm.validateBuildRequest(req); err != nil {
 		return 0, nil, err
 	}
@@ -62,10 +64,6 @@ func (tm *TunnelManager) BuildTunnelFromRequest(req tunnel.BuildTunnelRequest) (
 
 	result, messageID, peerHashes, err := tm.prepareAndSendBuild(req)
 	if err != nil {
-		return 0, peerHashes, err
-	}
-
-	if err := tm.finalizePendingBuild(result, messageID, req); err != nil {
 		return 0, peerHashes, err
 	}
 
@@ -96,7 +94,10 @@ func (tm *TunnelManager) handleOutboundReplyTunnel(req *tunnel.BuildTunnelReques
 		return oops.Errorf("outbound build requires active inbound tunnel for reply routing")
 	}
 
-	req.ReplyTunnelID = inbound.ID
+	req.ReplyTunnelID = inbound.GatewayID()
+	if len(inbound.Hops) > 0 {
+		req.ReplyGateway = inbound.Hops[0]
+	}
 	log.WithFields(logger.Fields{
 		"at":              "BuildTunnelFromRequest",
 		"reply_tunnel_id": inbound.ID,
@@ -113,44 +114,19 @@ func (tm *TunnelManager) prepareAndSendBuild(req tunnel.BuildTunnelRequest) (*tu
 
 	peerHashes := tm.extractPeerHashes(result)
 	tunnelState := tm.createTunnelStateFromResult(result)
-	pool := tm.getPoolForTunnel(req.IsInbound)
+	pool := tm.poolForRequest(req.OwnerPool, req.IsInbound)
+	if req.IsInbound && tm.inboundHandler != nil {
+		tunnelState.OnRemove = func() { tm.inboundHandler.UnregisterTunnel(result.TunnelID) }
+	}
 	pool.AddTunnel(tunnelState)
 	tm.trackPendingBuild(result, messageID, req)
 
-	// Send the build message first. For STBM, createShortTunnelBuildMessage
-	// overwrites result.ReplyKeys with the HKDF-derived keys that the remote
-	// hops will actually use to encrypt their reply slots. Registration must
-	// happen after send so it captures the correct keys.
-	//
-	// IMPORTANT: sendBuildMessage may block for tens of seconds while
-	// sessionProvider.GetSessionByHash performs a NetDB RouterInfo lookup
-	// (up to 30s) plus the outbound NTCP2/SSU2 dial and Noise handshake.
-	err = tm.sendBuildMessage(result, messageID)
+	// Prepare reply handling before transmission: a peer may reply as soon as
+	// Send queues the request on an established transport session.
+	err = tm.sendBuildMessage(result, messageID, req)
 	if err != nil {
 		tm.cleanupFailedBuild(result.TunnelID, messageID, req.IsInbound)
 		return nil, 0, peerHashes, oops.Wrapf(err, "failed to send build request")
-	}
-
-	// W-1 fix: Register inbound exploratory tunnel endpoint at build-request time
-	// so that the build reply (which arrives immediately after send) can be routed
-	// to ProcessTunnelReply rather than dropped. On cold start (no pre-existing
-	// reply tunnel), the build reply addresses the new tunnel ID; if that tunnel
-	// is not registered, the reply is silently dropped and the build expires.
-	// Registration at this point (before finalizePendingBuild) ensures the reply
-	// can be received. Client tunnels are registered in finalizePendingBuild with
-	// session context to route messages directly to the I2CP session.
-	//
-	// If registration fails here, finalizePendingBuild will attempt registration
-	// again as a fallback (e.g., if the registration service was not yet ready).
-	// Duplicate registrations are caught and silently ignored as expected failures.
-	if req.IsInbound && !req.IsClientTunnel && tm.inboundHandler != nil {
-		if err := tm.inboundHandler.RegisterExploratoryTunnel(result.TunnelID); err != nil {
-			log.WithError(err).WithFields(logger.Fields{
-				"at":        "prepareAndSendBuild",
-				"tunnel_id": result.TunnelID,
-			}).Warn("failed to register inbound exploratory tunnel endpoint")
-			// Continue anyway; finalizePendingBuild will attempt registration again
-		}
 	}
 
 	return result, messageID, peerHashes, nil
@@ -162,11 +138,12 @@ func (tm *TunnelManager) finalizePendingBuild(result *tunnel.TunnelBuildResult, 
 	// final HKDF-derived values used for reply decryption. Persist the final
 	// crypto context so late uncorrelated replies can be best-effort decrypted.
 	tm.updatePendingBuildReplyCrypto(messageID, result.ReplyKeys, result.ReplyIVs, result.NoiseHashes)
+	if state, ok := tm.poolForRequest(req.OwnerPool, req.IsInbound).GetTunnel(result.TunnelID); ok {
+		state.SetLayerKeys(result.LayerKeys)
+	}
 
-	// Anchor the 90-second expiration window to the moment the build message
-	// actually left this router, then arm cleanup at that horizon.
-	// BUG-5 fix: arm the timer at buildTimeout + buildExpireGrace (200ms) so
-	// replies that arrive on the boundary do not race the cleanup goroutine.
+	// Start the reply window after transport setup and serialization, immediately
+	// before transmission. The grace interval avoids boundary cleanup races.
 	tm.resetPendingBuildCreatedAt(messageID)
 	// Mirror the same re-anchoring onto the pool's TunnelState. The pool runs an
 	// independent build-expiry clock (tunnelBuildTimeout) keyed off CreatedAt,
@@ -174,7 +151,7 @@ func (tm *TunnelManager) finalizePendingBuild(result *tunnel.TunnelBuildResult, 
 	// sendBuildMessage step above. Without this, the pre-send delay is subtracted
 	// from the reply window and the pool can expire the tunnel while its build
 	// reply is still legitimately in flight.
-	if pool := tm.getPoolForTunnel(req.IsInbound); pool != nil {
+	if pool := tm.poolForRequest(req.OwnerPool, req.IsInbound); pool != nil {
 		pool.ReanchorBuildStart(result.TunnelID)
 	}
 	time.AfterFunc(90*time.Second+buildExpireGrace, func() {
@@ -194,6 +171,14 @@ func (tm *TunnelManager) finalizePendingBuild(result *tunnel.TunnelBuildResult, 
 		return oops.Wrapf(regErr, "failed to register pending build")
 	}
 
+	if req.OwnerPool != nil {
+		tm.replyProcessor.mutex.Lock()
+		tm.replyProcessor.pendingBuilds[result.TunnelID].retry = func() error {
+			return req.OwnerPool.RetryTunnelBuild(result.TunnelID, req.IsInbound, len(result.Hops))
+		}
+		tm.replyProcessor.mutex.Unlock()
+	}
+
 	// Store Noise transcript hashes for STBM reply AEAD decryption.
 	if len(result.NoiseHashes) > 0 {
 		if setErr := tm.replyProcessor.SetPendingBuildNoiseHashes(result.TunnelID, result.NoiseHashes); setErr != nil {
@@ -201,44 +186,21 @@ func (tm *TunnelManager) finalizePendingBuild(result *tunnel.TunnelBuildResult, 
 		}
 	}
 
-	// Register inbound tunnels:
-	// - Exploratory: W-1 fix registers early in prepareAndSendBuild to catch
-	//   replies immediately. finalizePendingBuild re-attempts as fallback if
-	//   early registration failed (e.g., if registration service was not yet ready).
-	//   Duplicate registrations are silently ignored (caught as "already registered").
-	// - Client: CRITICAL-1 fix registers here with session context for I2CP delivery,
-	//   ensuring inbound messages route to the owning session instead of being dropped.
+	// Register a decrypting endpoint before sending. Older registrar adapters
+	// remain usable for zero-hop tunnels and tests.
 	if req.IsInbound && tm.inboundHandler != nil {
-		if req.IsClientTunnel {
-			// Client tunnel: register with session context for I2CP message delivery
+		if registrar, ok := tm.inboundHandler.(interface {
+			RegisterInboundTunnel(tunnel.TunnelID, uint16, bool, []tunnel.LayerKeys) error
+		}); ok {
+			if err := registrar.RegisterInboundTunnel(result.TunnelID, req.ClientSessionID, req.IsClientTunnel, result.LayerKeys); err != nil {
+				return err
+			}
+		} else if req.IsClientTunnel {
 			if err := tm.inboundHandler.RegisterClientTunnel(result.TunnelID, req.ClientSessionID); err != nil {
-				log.WithError(err).WithFields(logger.Fields{
-					"at":         "finalizePendingBuild",
-					"tunnel_id":  result.TunnelID,
-					"session_id": req.ClientSessionID,
-				}).Warn("failed to register inbound client tunnel endpoint for session")
+				return err
 			}
-		} else {
-			// Exploratory tunnel: fallback registration (primary registration was in prepareAndSendBuild).
-			// If already registered, this silently fails with "tunnel already registered" —
-			// that's OK and expected if the early registration succeeded.
-			if err := tm.inboundHandler.RegisterExploratoryTunnel(result.TunnelID); err != nil {
-				// Log at Debug level for expected "already registered" errors,
-				// Warn level for unexpected errors
-				errorMsg := err.Error()
-				if !strings.Contains(errorMsg, "already registered") {
-					log.WithError(err).WithFields(logger.Fields{
-						"at":        "finalizePendingBuild",
-						"tunnel_id": result.TunnelID,
-					}).Warn("failed to register inbound exploratory tunnel endpoint")
-				} else {
-					log.WithFields(logger.Fields{
-						"at":        "finalizePendingBuild",
-						"tunnel_id": result.TunnelID,
-						"reason":    "already registered (expected if early registration succeeded)",
-					}).Debug("exploratory tunnel registration skipped (expected)")
-				}
-			}
+		} else if err := tm.inboundHandler.RegisterExploratoryTunnel(result.TunnelID); err != nil {
+			return err
 		}
 	}
 
@@ -268,7 +230,10 @@ func (tm *TunnelManager) buildZeroHopInbound(req tunnel.BuildTunnelRequest) (tun
 		Responses:       nil,
 		IsInbound:       true,
 	}
-	tm.inboundPool.AddTunnel(state)
+	if tm.inboundHandler != nil {
+		state.OnRemove = func() { tm.inboundHandler.UnregisterTunnel(result.TunnelID) }
+	}
+	tm.poolForRequest(req.OwnerPool, true).AddTunnel(state)
 	log.WithFields(logger.Fields{
 		"at":               "BuildTunnelFromRequest",
 		"tunnel_id":        result.TunnelID,
@@ -290,14 +255,16 @@ func (tm *TunnelManager) buildZeroHopInbound(req tunnel.BuildTunnelRequest) (tun
 		tm.outboundPool.RunMaintenanceNow()
 	}
 
-	// W-1 fix: Also register exploratory zero-hop inbound tunnels as
-	// control-plane endpoints so they can receive messages via TunnelData.
-	if !req.IsClientTunnel && tm.inboundHandler != nil {
-		if err := tm.inboundHandler.RegisterExploratoryTunnel(result.TunnelID); err != nil {
-			log.WithError(err).WithFields(logger.Fields{
-				"at":        "buildZeroHopInbound",
-				"tunnel_id": result.TunnelID,
-			}).Warn("failed to register zero-hop exploratory tunnel endpoint")
+	if tm.inboundHandler != nil {
+		var err error
+		if req.IsClientTunnel {
+			err = tm.inboundHandler.RegisterClientTunnel(result.TunnelID, req.ClientSessionID)
+		} else {
+			err = tm.inboundHandler.RegisterExploratoryTunnel(result.TunnelID)
+		}
+		if err != nil {
+			tm.poolForRequest(req.OwnerPool, true).RemoveTunnel(result.TunnelID)
+			return 0, nil, err
 		}
 	}
 
@@ -390,6 +357,7 @@ func (tm *TunnelManager) trackPendingBuild(result *tunnel.TunnelBuildResult, mes
 	defer tm.buildMutex.Unlock()
 
 	tm.pendingBuilds[messageID] = &buildRequest{
+		ownerPool:       req.OwnerPool,
 		tunnelID:        result.TunnelID,
 		messageID:       messageID,
 		replyTunnelID:   req.ReplyTunnelID,
@@ -422,7 +390,7 @@ func (tm *TunnelManager) updatePendingBuildReplyCrypto(messageID int, replyKeys 
 
 // resetPendingBuildCreatedAt re-anchors the createdAt timestamp of a tracked
 // pending build to time.Now(). Called immediately after the build message has
-// actually been queued onto the gateway session, so that the 90-second I2P
+// been serialized and is ready to send on the gateway session, so the 90-second I2P
 // build expiration window is measured from when the message left the
 // originator rather than from in-process struct creation. Without this, slow
 // outbound dials (RouterInfo lookup up to 30s + NTCP2/SSU2 handshake) eat
@@ -438,11 +406,22 @@ func (tm *TunnelManager) resetPendingBuildCreatedAt(messageID int) {
 
 // cleanupFailedBuild removes tunnel and pending build request on send failure
 func (tm *TunnelManager) cleanupFailedBuild(tunnelID tunnel.TunnelID, messageID int, isInbound bool) {
-	pool := tm.getPoolForTunnel(isInbound)
+	pool := tm.poolForMessage(messageID, isInbound)
 	pool.RemoveTunnel(tunnelID)
 	tm.buildMutex.Lock()
 	delete(tm.pendingBuilds, messageID)
 	tm.buildMutex.Unlock()
+
+	// Reply handling is registered before Send, so a send failure must also
+	// cancel its timer and discard the unused decryption context.
+	tm.replyProcessor.mutex.Lock()
+	if pending, ok := tm.replyProcessor.pendingBuilds[tunnelID]; ok {
+		if pending.TimeoutTimer != nil {
+			pending.TimeoutTimer.Stop()
+		}
+		delete(tm.replyProcessor.pendingBuilds, tunnelID)
+	}
+	tm.replyProcessor.mutex.Unlock()
 
 	// W-1 fix: unregister inbound exploratory endpoints on send failure so that
 	// a later-reused tunnel ID doesn't receive stale messages for this failed build
@@ -462,11 +441,11 @@ func (tm *TunnelManager) logBuildRequestSent(result *tunnel.TunnelBuildResult, m
 		"reply_tunnel_id":  req.ReplyTunnelID,
 		"our_identity":     req.OurIdentity.String()[:16],
 		"reply_gateway":    req.ReplyGateway.String()[:16],
-	}).Debug("Tunnel build request sent")
+	}).Info("Tunnel build request sent")
 }
 
 // sendBuildMessage sends a tunnel build message (STBM or VTB) based on the result.
-func (tm *TunnelManager) sendBuildMessage(result *tunnel.TunnelBuildResult, messageID int) error {
+func (tm *TunnelManager) sendBuildMessage(result *tunnel.TunnelBuildResult, messageID int, req tunnel.BuildTunnelRequest) error {
 	if tm.buildSessionProv == nil {
 		return oops.Errorf("no session provider available")
 	}
@@ -484,14 +463,34 @@ func (tm *TunnelManager) sendBuildMessage(result *tunnel.TunnelBuildResult, mess
 		return oops.Wrapf(err, "failed to get first hop identity")
 	}
 
+	// The last inbound hop sends the build response and tunnel traffic to us.
+	// Establish that bidirectional transport ourselves so it can reach us even
+	// when unsolicited inbound connections are blocked by a firewall or NAT.
+	if result.IsInbound && len(result.Hops) > 1 {
+		lastHash, err := result.Hops[len(result.Hops)-1].IdentHash()
+		if err != nil {
+			return oops.Wrapf(err, "failed to get last inbound hop identity")
+		}
+		if _, err := tm.buildSessionProv.GetSessionByHash(lastHash); err != nil {
+			return oops.Wrapf(err, "failed to establish inbound return path to %x", lastHash[:8])
+		}
+	}
+
 	session, err := tm.buildSessionProv.GetSessionByHash(peerHash)
 	if err != nil {
 		return oops.Wrapf(err, "failed to get session for gateway %x", peerHash[:8])
 	}
 
+	if req.OwnerPool != nil && req.OwnerPool.IsStopped() {
+		return oops.Errorf("tunnel pool stopped")
+	}
 	serialized, err := tm.createSerializedBuildMessage(result, messageID)
 	if err != nil {
 		return oops.Wrapf(err, "failed to create build message")
+	}
+
+	if err := tm.finalizePendingBuild(result, messageID, req); err != nil {
+		return err
 	}
 
 	if err := session.Send(serialized); err != nil {
@@ -503,11 +502,10 @@ func (tm *TunnelManager) sendBuildMessage(result *tunnel.TunnelBuildResult, mess
 		return oops.Wrapf(err, "failed to send tunnel build message to gateway %x", peerHash[:8])
 	}
 
-	log.WithFields(logger.Fields{
-		"message_id":   messageID,
-		"gateway_hash": logutil.HashPrefixPlain(peerHash),
-		"use_stbm":     result.UseShortBuild,
-	}).Debug("Sent tunnel build message")
+	if req.OwnerPool != nil && req.OwnerPool.IsStopped() {
+		return oops.Errorf("tunnel pool stopped")
+	}
+	log.WithField("message_id", messageID).Debug("Sent tunnel build message")
 	return nil
 }
 
@@ -524,6 +522,12 @@ func (tm *TunnelManager) createSerializedBuildMessage(result *tunnel.TunnelBuild
 	if result.UseShortBuild {
 		return tm.createSerializedShortTunnelBuildMessage(result, messageID)
 	}
+	result.LayerKeys = make([]tunnel.LayerKeys, len(result.Records))
+	for i, record := range result.Records {
+		copy(result.LayerKeys[i].Layer[:], record.LayerKey[:])
+		copy(result.LayerKeys[i].IV[:], record.IVKey[:])
+	}
+
 	return tm.createSerializedTunnelBuildMessage(result, messageID)
 }
 
@@ -545,6 +549,24 @@ func (tm *TunnelManager) createSerializedShortTunnelBuildMessage(result *tunnel.
 	}
 
 	tm.updateReplyKeysWithHKDF(result, replyKeys, noiseHashes)
+	result.LayerKeys = make([]tunnel.LayerKeys, len(postReplyCKs))
+	for i, ck := range postReplyCKs {
+		derived, err := hkdf64(ck, "SMTunnelLayerKey")
+		if err != nil {
+			return nil, err
+		}
+		copy(result.LayerKeys[i].Layer[:], derived[32:])
+		copy(result.LayerKeys[i].IV[:], derived[:32])
+		if !result.IsInbound && i == len(postReplyCKs)-1 {
+			var nextCK [32]byte
+			copy(nextCK[:], derived[:32])
+			derivedIV, err := hkdf64(nextCK, "TunnelLayerIVKey")
+			if err != nil {
+				return nil, err
+			}
+			copy(result.LayerKeys[i].IV[:], derivedIV[32:])
+		}
+	}
 
 	if err := tm.registerGarlicReplyKeys(noiseHashes, postReplyCKs, messageID, result.TunnelID); err != nil {
 		return nil, err

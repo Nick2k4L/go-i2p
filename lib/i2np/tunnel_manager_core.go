@@ -19,6 +19,7 @@ const buildExpireGrace = 200 * time.Millisecond
 // buildRequest tracks a pending tunnel build request for correlation with replies.
 // This enables matching build replies to the original request and managing timeouts.
 type buildRequest struct {
+	ownerPool       *tunnel.Pool
 	tunnelID        tunnel.TunnelID          // Unique tunnel ID for this request
 	messageID       int                      // I2NP message ID for correlation
 	replyTunnelID   tunnel.TunnelID          // Reply tunnel ID selected for outbound build replies
@@ -122,7 +123,7 @@ func NewTunnelManager(peerSelector tunnel.PeerSelector) *TunnelManager {
 		}
 		if inbound := tm.inboundPool.SelectTunnel(); inbound != nil {
 			if len(inbound.Hops) > 0 {
-				return inbound.ID, inbound.Hops[0], true
+				return inbound.GatewayID(), inbound.Hops[0], true
 			}
 			return inbound.ID, common.Hash{}, true
 		}

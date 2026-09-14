@@ -52,7 +52,7 @@ const (
 	ECIESLongBuildRecordCleartextLen = 464                                  // Cleartext length for ECIES-X25519 long-form build request records
 	ShortBuildRecordCleartextLen     = buildrecord.ShortCleartextLen        // 154
 	ShortRecordHeaderSize            = 64                                   // toPeer(16) + ephemeralKey(32) + MAC(16)
-	DefaultExpirationSeconds         = buildrecord.DefaultExpirationSeconds // 480
+	DefaultExpirationSeconds         = buildrecord.DefaultExpirationSeconds // 600
 )
 
 // DefaultExpirationTolerance is the default expiration tolerance for clock skew (5 minutes into the past).

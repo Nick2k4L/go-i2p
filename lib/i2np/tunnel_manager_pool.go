@@ -38,3 +38,19 @@ func (tm *TunnelManager) retryTunnelBuild(tunnelID tunnel.TunnelID, isInbound bo
 	}
 	return pool.RetryTunnelBuild(tunnelID, isInbound, hopCount)
 }
+
+func (tm *TunnelManager) poolForRequest(owner *tunnel.Pool, inbound bool) *tunnel.Pool {
+	if owner != nil {
+		return owner
+	}
+	return tm.getPoolForTunnel(inbound)
+}
+func (tm *TunnelManager) poolForMessage(messageID int, inbound bool) *tunnel.Pool {
+	tm.buildMutex.RLock()
+	req := tm.pendingBuilds[messageID]
+	tm.buildMutex.RUnlock()
+	if req != nil {
+		return tm.poolForRequest(req.ownerPool, inbound)
+	}
+	return tm.getPoolForTunnel(inbound)
+}
