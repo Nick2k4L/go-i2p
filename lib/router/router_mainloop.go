@@ -250,29 +250,94 @@ func (r *Router) handleNewConnection(conn net.Conn) {
 		sessionLog.Debug("Started monitoring new inbound NTCP2 session")
 
 	case *ssu2noise.SSU2Addr:
-		peerHash := common.Hash(addr.RouterHash())
-		sessionLog := logger.WithField("peer_hash", logutil.HashPrefix(peerHash))
-		ssu2Conn, ok := conn.(*ssu2noise.SSU2Conn)
+		// The SSU2 transport and muxer both wrap the accepted connection.
+		currentConn := conn
+		for {
+			if tc, ok := currentConn.(*transport.TrackedConn); ok {
+				currentConn = tc.Conn
+			} else {
+				break
+			}
+		}
+
+		ssu2Conn, ok := currentConn.(*ssu2noise.SSU2Conn)
 		if !ok {
-			sessionLog.WithField("conn_type", fmt.Sprintf("%T", conn)).Error("Inbound SSU2 connection is not *ssu2noise.SSU2Conn, dropping")
-			conn.Close()
+			sessionLogger.WithField("conn_type", fmt.Sprintf("%T", conn)).Error("Inbound SSU2 connection is not *ssu2noise.SSU2Conn, dropping")
+			go conn.Close() // Async close to prevent blocking the accept loop
 			return
 		}
-		session := ssu2.NewSSU2Session(ssu2Conn, r.ctx, sessionLog)
-		r.attachInboundSSU2TransportCallbacks(session)
-		session.AppendCleanupCallback(func() { r.removeSession(peerHash) })
-		r.addSession(peerHash, session)
+		// Handshaking and closing may block, so neither belongs on the accept loop.
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
+			if err := r.establishSecureSSU2Session(ssu2Conn, sessionLogger); err != nil {
+				_ = ssu2Conn.CloseImmediate()
+				_ = conn.Close()
+				return
+			}
+
+			// The pre-handshake address contains only a provisional peer hash.
+			peerAddr, ok := ssu2Conn.RemoteAddr().(*ssu2noise.SSU2Addr)
+			if !ok || r.ctx.Err() != nil {
+				_ = ssu2Conn.CloseImmediate()
+				_ = conn.Close()
+				return
+			}
+
+			peerHash := common.Hash(peerAddr.RouterHash())
+			sessionLog := logger.WithField("peer_hash", logutil.HashPrefix(peerHash))
+			session := ssu2.NewSSU2Session(ssu2Conn, r.ctx, sessionLog)
+
+			r.attachInboundSSU2TransportCallbacks(session)
+			session.AppendCleanupCallback(func() {
+				r.sessionMutex.Lock()
+				if r.activeSessions[peerHash] == session {
+					delete(r.activeSessions, peerHash)
+				}
+				r.sessionMutex.Unlock()
+			})
+			// Close the outer wrappers as well to release transport and muxer slots.
+			session.AppendCleanupCallback(func() { _ = conn.Close() })
+			r.addSession(peerHash, session)
+			defer session.Close()
+			sessionLog.Debug("Started monitoring new inbound SSU2 session")
+
 			r.processSessionMessages(session, staticAuthenticatedPeer{hash: peerHash, handshakeComplete: true})
 		}()
-		sessionLog.Debug("Started monitoring new inbound SSU2 session")
 
 	default:
 		sessionLogger.WithField("addr_type", fmt.Sprintf("%T", conn.RemoteAddr())).Error("Unrecognised inbound connection address type, dropping")
 		conn.Close()
 	}
+}
+
+func (r *Router) establishSecureSSU2Session(ssu2Conn *ssu2noise.SSU2Conn, sessionLog *logger.Entry) error {
+	handshakeCtx, cancel := context.WithTimeout(r.ctx, 15*time.Second)
+
+	err := ssu2Conn.Handshake(handshakeCtx)
+	cancel()
+	if err != nil {
+		sessionLog.WithError(err).Error("SSU2 inbound handshake failed, dropping")
+		return err
+	}
+
+	// Replay Check: find the SSU2Transport and call CheckConnectionReplay
+	muxer := r.transports.Load()
+	var ssu2Tr *ssu2.SSU2Transport
+	if muxer != nil {
+		for _, tr := range muxer.GetTransports() {
+			if t, ok := tr.(*ssu2.SSU2Transport); ok {
+				ssu2Tr = t
+				break
+			}
+		}
+	}
+	if ssu2Tr != nil && ssu2Tr.CheckConnectionReplay(ssu2Conn) {
+		sessionLog.Warn("SSU2 anti-replay check rejected inbound connection")
+		return errors.New("SSU2 anti-replay check failed")
+	}
+
+	return nil
 }
 
 // attachInboundSSU2TransportCallbacks wires transport-level callbacks into an

@@ -533,7 +533,7 @@ func (t *SSU2Transport) trackInboundConnection(conn net.Conn) (net.Conn, bool) {
 	// Primary path: use go-noise replay material from the validated
 	// SessionRequest via conn.GetReplayToken(). See checkConnectionReplay()
 	// for nil-token fallback behavior.
-	if t.checkConnectionReplay(conn) {
+	if t.CheckConnectionReplay(conn) {
 		// Replay detected: close connection and unreserve slot
 		t.sessionRegistry.DecrementCountSafe()
 		conn.Close()
@@ -565,7 +565,7 @@ func (t *SSU2Transport) extractPeerHash(conn net.Conn) data.Hash {
 // checkConnectionReplay performs anti-replay validation for an inbound SSU2 connection.
 // Primary path (preferred): when conn is *ssu2noise.SSU2Conn and SessionRequest
 // has been validated, use conn.GetReplayToken() directly for replay-cache checks.
-func (t *SSU2Transport) checkConnectionReplay(conn net.Conn) bool {
+func (t *SSU2Transport) CheckConnectionReplay(conn net.Conn) bool {
 	if t.handler == nil {
 		// Handler not initialized; cannot check replay (should not happen in normal operation)
 		return false
